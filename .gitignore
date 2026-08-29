@@ -1,2 +1,4 @@
 /target
 .autoenv.zsh
+/.direnv
+/result

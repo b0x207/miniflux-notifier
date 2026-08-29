@@ -28,7 +28,11 @@ fn main() -> Result<()> {
     let mut entries_cache: Option<Entries> = None;
 
     if std::env::var("RUST_LOG").is_err() {
-        std::env::set_var("RUST_LOG", "info");
+        // Unsafe is acceptable as manipulating `envp` is only dangerous when there are multiple
+        // threads.
+        unsafe {
+            std::env::set_var("RUST_LOG", "info");
+        }
     }
     env_logger::init();
 
@@ -148,10 +152,10 @@ fn send_notification_batch(entries: Vec<Entry>) -> Result<()> {
                 .finalize();
             match notif.show() {
                 Ok(handle) => handle.wait_for_action(|action| {
-                    if action == "open" {
-                        if let Err(e) = open::that_detached(&entry.url) {
-                            error!("{:?}", e);
-                        }
+                    if action == "open"
+                        && let Err(e) = open::that_detached(&entry.url)
+                    {
+                        error!("{:?}", e);
                     }
                 }),
                 Err(e) => {
