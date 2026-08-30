@@ -1,9 +1,8 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::Parser;
 use log::{error, info};
-use notify_rust::Notification;
-use std::thread;
-use std::time::Duration;
+use notify_rust::{Notification, NotificationResponse};
+use std::time::{Duration, SystemTime};
 
 mod models;
 
@@ -15,7 +14,7 @@ struct Args {
     server: String,
 
     /// The wait period between each check in minutes
-    #[clap(default_value = "60")]
+    #[clap(default_value = "10")]
     wait_period: u64,
 
     /// The API key used to authenticate with the Miniflux server
@@ -23,9 +22,9 @@ struct Args {
     miniflux_api_key: String,
 }
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     let args = Args::parse();
-    let mut entries_cache: Option<Entries> = None;
 
     if std::env::var("RUST_LOG").is_err() {
         // Unsafe is acceptable as manipulating `envp` is only dangerous when there are multiple
@@ -36,50 +35,31 @@ fn main() -> Result<()> {
     }
     env_logger::init();
 
-    let server_check = check_for_server_existence(&args.server);
-    if !server_check.unwrap_or(false) {
-        eprintln!(
+    if check_for_server_existence(&args.server).await.is_err() {
+        anyhow::bail!(
             "Server was not found! Make sure it is running and the specified URL is correct."
         );
     }
 
-    info!("Server check passed. Beginning main loop.");
+    info!(
+        "Server check passed. Will poll for updates every {} minutes",
+        args.wait_period
+    );
+
+    let mut last_check = SystemTime::now();
+    let sleep_time = Duration::new(60 * args.wait_period, 0);
 
     loop {
-        if entries_cache.is_some() {
-            thread::sleep(Duration::new(60 * args.wait_period, 0));
-        }
-
-        let unread_entries = get_unread_entries(&args.server, &args.miniflux_api_key);
-
-        if unread_entries.is_err() {
-            error!("Failed to get unread entries!\n\t{:?}", unread_entries);
-            continue;
-        }
-
-        let unread_entries = unread_entries.unwrap();
+        let since = last_check;
+        last_check = SystemTime::now();
+        let unread_entries = get_unread_entries(&args.server, &args.miniflux_api_key, since)
+            .await
+            .context("Fetching unread entries")?;
 
         info!("Unread entries: {}", unread_entries.entries.len());
+        send_notification_batch(unread_entries.entries).await?;
 
-        // Don't consider any "new" entries when there is no cache
-        if let Some(entries_cache) = entries_cache {
-            let first_new_index = find_new_entries(&entries_cache.entries, &unread_entries.entries);
-
-            if let Ok(first_new_index) = first_new_index {
-                if first_new_index != 0 {
-                    let nb = send_notification_batch(
-                        unread_entries.entries[0..first_new_index + 1].to_vec(),
-                    );
-                    if nb.is_err() {
-                        error!("{:?}", nb);
-                    }
-                }
-            } else {
-                error!("{:?}", first_new_index);
-            }
-        }
-
-        entries_cache = Some(unread_entries);
+        tokio::time::sleep(sleep_time).await;
     }
 }
 
@@ -88,87 +68,68 @@ fn main() -> Result<()> {
 /// This serves two purposes:
 /// 1. Handling invalid URLs that a user might provide
 /// 2. Checking that the server is available
-fn check_for_server_existence(server: &String) -> Result<bool> {
+async fn check_for_server_existence(server: &String) -> Result<()> {
     info!("Checking for server existence");
-    reqwest::blocking::get(format!("{}/healthcheck", server))?.error_for_status()?;
-    Ok(true)
+    reqwest::get(format!("{}/healthcheck", server))
+        .await?
+        .error_for_status()?;
+    Ok(())
 }
 
-fn get_unread_entries(server: &String, auth_token: &String) -> Result<Entries> {
-    let client = reqwest::blocking::Client::new();
+/// Get all of the unread entries that have been created since the specified time
+async fn get_unread_entries(
+    server: &String,
+    auth_token: &String,
+    since: SystemTime,
+) -> Result<Entries> {
+    let client = reqwest::Client::new();
     let entries = client
         .get(format!(
-            "{}/v1/entries?status=unread&direction=desc",
-            server
+            "{}/v1/entries?status=unread&direction=desc&after={}",
+            server,
+            since.duration_since(std::time::UNIX_EPOCH)?.as_secs()
         ))
         .header("X-Auth-Token", auth_token)
-        .send()?
+        .send()
+        .await?
         .error_for_status()?
-        .json::<Entries>()?;
+        .json::<Entries>()
+        .await?;
+
     Ok(entries)
 }
 
-/// Finds the index in a list of entries to the first "new" entry.
-///
-/// We want to figure out which entries are "new". To do this, we start with the first
-/// entry in the cache and look through the list of unread entries. If we find a match,
-/// we can note where the match is and know that all of the entries that came before it
-/// are "new". If we don't find a match, we repeat the process using the second entry in
-/// the cache and continue in this manner. If every entry in the cache has been
-/// exhausted, then everything in the unread entry list is "new".
-fn find_new_entries(cache: &Vec<Entry>, new: &[Entry]) -> Result<usize> {
-    if new.is_empty() {
-        return Err(anyhow::anyhow!(
-            "No entries provided when searching for new entries"
-        ));
-    }
-
-    for cached_entry in cache {
-        for (i, new_entry) in new.iter().enumerate() {
-            // Found first "new" entry
-            if cached_entry.hash == new_entry.hash {
-                return Ok(i);
-            }
-        }
-    }
-
-    // Everything must be "new" then
-    Ok(0)
-}
-
-fn send_notification_batch(entries: Vec<Entry>) -> Result<()> {
-    let mut threads = vec![];
-
+/// Send a set of notifications in bulk
+async fn send_notification_batch(entries: Vec<Entry>) -> Result<()> {
     for entry in entries {
-        threads.push(thread::spawn(move || {
-            let source = match &entry.author.is_empty() {
-                true => &entry.feed.title,
-                false => &entry.author,
-            };
-            let notif = Notification::new()
-                .summary(format!("New RSS Entry from {}", source).as_str())
-                .body(&entry.title)
-                .action("open", "Open in web browser")
-                .finalize();
-            match notif.show() {
-                Ok(handle) => handle.wait_for_action(|action| {
-                    if action == "open"
-                        && let Err(e) = open::that_detached(&entry.url)
-                    {
-                        error!("{:?}", e);
-                    }
-                }),
-                Err(e) => {
-                    error!("{:?}", e);
-                }
-            };
-        }));
-    }
+        let source = match &entry.author.is_empty() {
+            true => &entry.feed.title,
+            false => &entry.author,
+        };
 
-    for thread in threads {
-        if let Err(e) = thread.join() {
-            error!("{:?}", e);
-        }
+        let handle = Notification::new()
+            .summary(format!("New RSS Entry from {}", source).as_str())
+            .body(&entry.title)
+            .action("open", "Open in web browser")
+            .timeout(notify_rust::Timeout::Milliseconds(2000))
+            .show_async()
+            .await?;
+
+        tokio::spawn(async move {
+            handle
+                .wait_for_action_async(|response| match response {
+                    NotificationResponse::Action(action) if action == "open" => {
+                        if let Err(e) = open::that_detached(&entry.url) {
+                            error!("{:?}", e);
+                        }
+                    }
+                    NotificationResponse::Action(_) => {}
+                    NotificationResponse::Closed(_) => {}
+                    NotificationResponse::Reply(_) => {}
+                    NotificationResponse::Default => {}
+                })
+                .await;
+        });
     }
 
     Ok(())

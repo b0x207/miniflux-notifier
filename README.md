@@ -2,7 +2,7 @@
 
 Get desktop notifications at select intervals about new, unread articles from a Miniflux server.
 
-The program is a simple daemon for linux that can be run on a per-user basis.
+The program is a daemon for linux that can be run on a per-user basis.
 
 ## Building
 

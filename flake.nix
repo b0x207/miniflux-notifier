@@ -25,7 +25,12 @@
       ];
 
       perSystem =
-        { config, pkgs, ... }:
+        {
+          config,
+          pkgs,
+          system,
+          ...
+        }:
         let
           naersk' = pkgs.callPackage inputs.naersk { };
           treefmtEval = inputs.treefmt-nix.lib.evalModule pkgs ./treefmt.nix;
@@ -44,6 +49,7 @@
               rust-analyzer
               clippy
               cargo-audit
+              inputs.lorem-rss.packages.${system}.default
             ];
           };
 
